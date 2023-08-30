@@ -5,11 +5,12 @@
 implementation for Question-Answering"""
 
 
-from typing import Optional
+from typing import Any, List, Optional, Tuple, Union
 
 import lightning as L
 import torch
 import torch.nn as nn
+import torchmetrics
 import transformers
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
@@ -36,19 +37,17 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.config: transformers.PretrainedConfig = (
             AutoConfig.from_pretrained(self.lm_name)
         )
-        self.lm: transformers.PretrainedModel = AutoModel.from_pretrained(
-            self.lm_name
+        self.lm: transformers.PretrainedModel = AutoModel.from_config(
+            self.config, add_pooling_layer=False
         )
         self.tokenizer: transformers.PretrainedTokenizer = (
             AutoTokenizer.from_pretrained(
                 self.lm_name, truncation_side=self.truncation_side
             )
         )
-
         self.qa_outputs = nn.Linear(
             in_features=self.config.hidden_size, out_features=2
         )
-
         self.sigmoid = nn.Sigmoid()
 
         # ==================================================
@@ -57,11 +56,49 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
 
         self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, *args, **kwargs):
-        pass
+        # ================================
+        # Metrics (also Logging of Losses)
+        # ================================
 
-    def model_step(self, *args, **kwargs):
-        pass
+        self.train_squad = None
+        self.test_squad = None
+        self.validation_squad = None
+        self.validation_squad_best = torchmetrics.MaxMetric()
+        self.train_loss = torchmetrics.MeanMetric()
+        self.test_loss = torchmetrics.MeanMetric()
+        self.validation_loss = torchmetrics.MeanMetric()
+
+    def process(self, q: Union[str, List[str]], c: Union[str, List[str]]):
+        if isinstance(q, str) and isinstance(c, str):
+            return self.tokenizer(
+                q,
+                c,
+                truncation="only_second",
+                padding="longest",
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+
+        return self.tokenizer(
+            [[a, b] for a, b in zip(q, c)],
+            truncation="only_second",
+            padding="longest",
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+    def forward(self, q: Union[str, List[str]], c: Union[str, List[str]]):
+        tokenized = self.process(q, c)
+        tokenized.to(self.device)
+        outputs = self.lm(**tokenized)
+        hidden_states = outputs.last_hidden_state
+        qa_outputs = self.qa_outputs(hidden_states)
+        start_logits, end_logits = qa_outputs.split(1, dim=-1)
+        return start_logits, end_logits
+
+    def model_step(self, batch: Any):
+        q, a, c, idx = batch
+        start_logits, end_logits = self.forward(q, c)
 
     def training_step(self, *args, **kwargs):
         pass
