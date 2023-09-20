@@ -64,9 +64,18 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.test_squad = None
         self.validation_squad = None
         self.validation_squad_best = torchmetrics.MaxMetric()
+
+        self.train_start_loss = torchmetrics.MeanMetric()
+        self.train_end_loss = torchmetrics.MeanMetric()
         self.train_loss = torchmetrics.MeanMetric()
-        self.test_loss = torchmetrics.MeanMetric()
+
+        self.validation_start_loss = torchmetrics.MeanMetric()
+        self.validation_end_loss = torchmetrics.MeanMetric()
         self.validation_loss = torchmetrics.MeanMetric()
+
+        self.test_start_loss = torchmetrics.MeanMetric()
+        self.test_end_loss = torchmetrics.MeanMetric()
+        self.test_loss = torchmetrics.MeanMetric()
 
     def process(self, q: Union[str, List[str]], c: Union[str, List[str]]):
         if isinstance(q, str) and isinstance(c, str):
@@ -87,21 +96,42 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
             return_tensors="pt",
         )
 
-    def convert_to_compatible_tokens(self, a: str, c: str) -> Tuple[int, int]:
+    def convert_to_compatible_tokens(
+        self, a: List[str], c: List[str]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Convert provided answers to model-compatible start and end tokens.
         Used in loss computation"""
-        context_list = self.tokenizer(
-            c, return_tensors="pt"
+        context_ids_list = self.tokenizer(
+            c, return_tensors="pt", truncation=True, padding="longest"
         ).input_ids.tolist()
-        answer_list = (
-            self.tokenizer(a, return_tensors="pt").input_ids[1:-1].tolist()
-        )
-        start = [
-            idx
-            for idx in range(len(context_list) - len(answer_list) + 1)
-            if context_list[idx : idx + len(answer_list)] == answer_list
+        answer_ids_list = self.tokenizer(
+            a, return_tensors="pt", truncation=True, padding="longest"
+        ).input_ids.tolist()
+        answer_ids_list = [
+            item[
+                1 : item.index(
+                    self.tokenizer.encode(self.tokenizer.sep_token)[1]
+                )
+            ]
+            for item in answer_ids_list
         ]
-        return start, start + len(answer_list)
+        start_idx = [
+            [
+                idx
+                for idx in range(
+                    len(context_ids_list[i]) - len(answer_ids_list[i]) + 1
+                )
+                if context_ids_list[i][idx : idx + len(answer_ids_list[i])]
+                == answer_ids_list[i]
+            ]
+            for i in range(len(answer_ids_list))
+        ]
+        end_idx = [
+            [start_idx[i][0] + len(answer_ids_list[i])]
+            for i in range(len(start_idx))
+        ]
+        start_idx = torch.tensor(start_idx)
+        end_idx = torch.tensor(end_idx)
 
     def forward(
         self, q: Union[str, List[str]], c: Union[str, List[str]]
@@ -114,9 +144,16 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         start_logits, end_logits = qa_outputs.split(1, dim=-1)
         return start_logits, end_logits
 
-    def model_step(self, batch: Any):
+    def model_step(
+        self, batch: Tuple[List[str], List[str], List[str], torch.Tensor]
+    ):
         q, a, c, idx = batch
         start_logits, end_logits = self.forward(q, c)
+        start_positions, end_positions = self.convert_to_compatible_tokens(
+            a, c
+        )
+
+
 
     def training_step(self, *args, **kwargs):
         pass
