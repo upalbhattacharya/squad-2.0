@@ -87,7 +87,25 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
             return_tensors="pt",
         )
 
-    def forward(self, q: Union[str, List[str]], c: Union[str, List[str]]):
+    def convert_to_compatible_tokens(self, a: str, c: str) -> Tuple[int, int]:
+        """Convert provided answers to model-compatible start and end tokens.
+        Used in loss computation"""
+        context_list = self.tokenizer(
+            c, return_tensors="pt"
+        ).input_ids.tolist()
+        answer_list = (
+            self.tokenizer(a, return_tensors="pt").input_ids[1:-1].tolist()
+        )
+        start = [
+            idx
+            for idx in range(len(context_list) - len(answer_list) + 1)
+            if context_list[idx : idx + len(answer_list)] == answer_list
+        ]
+        return start, start + len(answer_list)
+
+    def forward(
+        self, q: Union[str, List[str]], c: Union[str, List[str]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         tokenized = self.process(q, c)
         tokenized.to(self.device)
         outputs = self.lm(**tokenized)
