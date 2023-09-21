@@ -446,7 +446,6 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     # ===========================================
     #                   Hooks
     # ===========================================
-    # NOTE: Cannot find these hooks in the source code of LightningModule
 
     def on_train_start(self, *args, **kwargs):
         pass
