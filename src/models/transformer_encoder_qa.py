@@ -5,7 +5,10 @@
 implementation for Question-Answering"""
 
 
-from typing import Any, List, Optional, Tuple, Union
+import os
+from typing import Any, Dict, List, Optional
+from typing import SupportsFloat as Numeric
+from typing import Tuple, Union
 
 import lightning as L
 import torch
@@ -13,6 +16,13 @@ import torch.nn as nn
 import torchmetrics
 import transformers
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+SINGLE_PRED_TYPE = Dict[str, str]
+PREDS_TYPE = Union[SINGLE_PRED_TYPE, List[SINGLE_PRED_TYPE]]
+SINGLE_TARGET_TYPE = Dict[
+    str, Union[str, Dict[str, Union[List[str], List[int]]]]
+]
+TARGETS_TYPE = Union[SINGLE_TARGET_TYPE, List[SINGLE_TARGET_TYPE]]
 
 
 class TransformerEncoderQuestionAnswering(L.LightningModule):
@@ -54,7 +64,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         # Training Objectives, Learning Rates and Schedulers
         # ==================================================
 
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(reduction="sum")
 
         # ================================
         # Metrics (also Logging of Losses)
@@ -63,7 +73,8 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.train_squad = None
         self.test_squad = None
         self.validation_squad = None
-        self.validation_squad_best = torchmetrics.MaxMetric()
+        self.validation_squad_f1_best = torchmetrics.MaxMetric()
+        self.validation_squad_exact_match_best = torchmetrics.MaxMetric()
 
         self.train_start_loss = torchmetrics.MeanMetric()
         self.train_end_loss = torchmetrics.MeanMetric()
@@ -133,6 +144,90 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         start_idx = torch.tensor(start_idx)
         end_idx = torch.tensor(end_idx)
 
+    def convert_targets_to_SQuAD_format(
+        a: List[str], a_start: torch.Tensor, c: List[str], idx: List[str]
+    ) -> TARGETS_TYPE:
+        """Convert target data into `torchmetrics.text.SQuAD` compatible
+        format"""
+        targets = []
+        for ans, a_start_idx, context, id in zip(a, a_start, c, idx):
+            targets.append(
+                {
+                    "answers": {
+                        "answer_start": [a_start_idx.item()],
+                        "text": [ans],
+                    },
+                    "id": id,
+                }
+            )
+        return targets
+
+    def get_predicted_texts(
+        self,
+        start_logits: torch.Tensor,
+        end_logits: torch.Tensor,
+        context: str,
+    ) -> str:
+        """Convert start and end logits to predicted text from a given
+        context"""
+        start_position = start_logits.argmax()
+        end_position = end_logits.argmax()
+        context_encoded = self.tokenizer(
+            context, return_tensors="pt", truncation=True, padding="longest"
+        ).input_ids.squeeze()
+        text = self.tokenizer.decode(
+            context_encoded[start_position:end_position]
+        )
+        return text
+
+    def convert_predictions_to_SQuAD_format(
+        self,
+        start_logits: torch.Tensor,
+        end_logits: torch.Tensor,
+        context: List[str],
+        idx: List[str],
+    ) -> PREDS_TYPE:
+        """Get prediction texts and convert to `torchmetrics.text.SQuAD`
+        compatible format"""
+        predictions = []
+        for s, e, c, id in zip(start_logits, end_logits, context, idx):
+            text = self.get_predicted_texts(s, e, c)
+            predictions.append({"prediction_text": text, "id": id})
+        return predictions
+
+    def log_stats(
+        self,
+        name: str,
+        start_loss: torch.Tensor,
+        end_loss: torch.Tensor,
+        loss: torch.Tensor,
+        squad: Dict[Numeric, Numeric],
+    ) -> None:
+        self.log(
+            os.path.join(name, "start_loss"),
+            start_loss,
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            os.path.join(name, "end_loss"),
+            end_loss,
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            os.path.join(name, "loss"), loss, on_step=False, on_epoch=True
+        )
+        self.log(
+            os.path.join(name, "f1"), squad["f1"], on_step=False, on_epoch=True
+        )
+        self.log(
+            os.path.join(name, "exact_match"),
+            squad["exact_match"],
+            on_step=False,
+            on_epoch=True,
+        )
+
     def forward(
         self, q: Union[str, List[str]], c: Union[str, List[str]]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -145,30 +240,208 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         return start_logits, end_logits
 
     def model_step(
-        self, batch: Tuple[List[str], List[str], List[str], torch.Tensor]
-    ):
-        q, a, c, idx = batch
+        self,
+        batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        q, a, a_start, c, idx = batch
         start_logits, end_logits = self.forward(q, c)
         start_positions, end_positions = self.convert_to_compatible_tokens(
             a, c
         )
+        ignore_index = start_logits.size(1)
+        start_positions = start_positions.clamp(0, ignore_index)
+        end_positions = end_positions.clamp(0, ignore_index)
+        criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        start_loss = criterion(start_logits, start_positions)
+        end_loss = criterion(end_logits, end_positions)
+        loss = (start_loss + end_loss) / 2.0
+        return (
+            start_loss,
+            end_loss,
+            loss,
+            start_logits,
+            end_logits,
+            start_positions,
+            end_positions,
+        )
 
+    def training_step(
+        self,
+        batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        q, a, a_start, c, idx = batch
+        (
+            start_loss,
+            end_loss,
+            loss,
+            start_logits,
+            end_logits,
+            start_positions,
+            end_positions,
+        ) = self.model_step(batch)
 
+        self.train_start_loss(start_loss)
+        self.train_end_loss(end_loss)
+        self.train_loss(loss)
+        targets_SQuAD: TARGETS_TYPE = self.convert_targets_to_SQuAD_format(
+            a, a_start, c, idx
+        )
+        predicted_texts_SQuAD: PREDS_TYPE = (
+            self.convert_predictions_to_SQuAD_format(
+                start_logits, end_logits, c, idx
+            )
+        )
+        self.train_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.log_stats(
+            "train",
+            self.train_start_loss,
+            self.train_end_loss,
+            self.train_loss,
+            self.train_squad,
+        )
 
-    def training_step(self, *args, **kwargs):
-        pass
+        return {
+            "loss": loss,
+            "start_logits": start_logits,
+            "end_logits": end_logits,
+        }
 
-    def validation_step(self, *args, **kwargs):
-        pass
+    def validation_step(
+        self,
+        batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        q, a, a_start, c, idx = batch
+        (
+            start_loss,
+            end_loss,
+            loss,
+            start_logits,
+            end_logits,
+            start_positions,
+            end_positions,
+        ) = self.model_step(batch)
 
-    def test_step(self, *args, **kwargs):
-        pass
+        self.validation_start_loss(start_loss)
+        self.validation_end_loss(end_loss)
+        self.validation_loss(loss)
+        targets_SQuAD: TARGETS_TYPE = self.convert_targets_to_SQuAD_format(
+            a, a_start, c, idx
+        )
+        predicted_texts_SQuAD: PREDS_TYPE = (
+            self.convert_predictions_to_SQuAD_format(
+                start_logits, end_logits, c, idx
+            )
+        )
+        self.validation_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.log_stats(
+            "validation",
+            self.validation_start_loss,
+            self.validation_end_loss,
+            self.validation_loss,
+            self.validation_squad,
+        )
 
-    def predict_step(self, *args, **kwargs):
-        pass
+        return {
+            "loss": loss,
+            "start_logits": start_logits,
+            "end_logits": end_logits,
+        }
+
+    def test_step(
+        self,
+        batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        q, a, a_start, c, idx = batch
+        (
+            start_loss,
+            end_loss,
+            loss,
+            start_logits,
+            end_logits,
+            start_positions,
+            end_positions,
+        ) = self.model_step(batch)
+
+        self.test_start_loss(start_loss)
+        self.test_end_loss(end_loss)
+        self.test_loss(loss)
+        targets_SQuAD: TARGETS_TYPE = self.convert_targets_to_SQuAD_format(
+            a, a_start, c, idx
+        )
+        predicted_texts_SQuAD: PREDS_TYPE = (
+            self.convert_predictions_to_SQuAD_format(
+                start_logits, end_logits, c, idx
+            )
+        )
+        self.test_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.log_stats(
+            "test",
+            self.test_start_loss,
+            self.test_end_loss,
+            self.test_loss,
+            self.test_squad,
+        )
+
+        return {
+            "loss": loss,
+            "start_logits": start_logits,
+            "end_logits": end_logits,
+        }
+
+    def predict_step(self, q: Union[str, List[str]], c: Union[str, List[str]]):
+        start_logits, end_logits = self(q, c)
+        predicted = []
+        for s, e, context in zip(start_logits, end_logits, c):
+            predicted.append(self.get_predicted_texts(s, e, context))
+
+        return predicted
 
     def configure_optimizers(self):
-        pass
+        optimizer = self.hparams.optimizer(params=self.parameters())
+        if self.hparams.scheduler is not None:
+            scheduler = self.hparams.scheduler(optimizer=optimizer)
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+        return {"optimizer": optimizer}
 
     # ===========================================
     #                   Hooks
@@ -181,8 +454,22 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     def on_train_epoch_end(self, *args, **kwargs):
         pass
 
-    def on_val_epoch_end(self, *args, **kwargs):
-        pass
+    def on_validation_epoch_end(self, *args, **kwargs):
+        val_squad = self.validation_squad.compute()
+        val_f1 = val_squad["f1"]
+        val_exact_match = val_squad["exact_match"]
+        self.validation_squad_f1_best(val_f1)
+        self.validation_squad_exact_match_best(val_exact_match)
+        self.log(
+            "val/best_f1",
+            self.validation_squad_f1_best.compute(),
+            prog_bar=True,
+        )
+        self.log(
+            "val/best_exact_match",
+            self.validation_squad_exact_match_best.compute(),
+            prog_bar=True,
+        )
 
     def on_test_epoch_end(self, *args, **kwargs):
         pass
