@@ -70,9 +70,9 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         # Metrics (also Logging of Losses)
         # ================================
 
-        self.train_squad = None
-        self.test_squad = None
-        self.validation_squad = None
+        self.train_squad = torchmetrics.text.SQuAD()
+        self.test_squad = torchmetrics.text.SQuAD()
+        self.validation_squad = torchmetrics.text.SQuAD()
         self.validation_squad_f1_best = torchmetrics.MaxMetric()
         self.validation_squad_exact_match_best = torchmetrics.MaxMetric()
 
@@ -134,18 +134,26 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
                 )
                 if context_ids_list[i][idx : idx + len(answer_ids_list[i])]
                 == answer_ids_list[i]
-            ]
+            ][0]
             for i in range(len(answer_ids_list))
         ]
         end_idx = [
-            [start_idx[i][0] + len(answer_ids_list[i])]
+            [start_idx[i] + len(answer_ids_list[i])]
             for i in range(len(start_idx))
         ]
+
         start_idx = torch.tensor(start_idx)
         end_idx = torch.tensor(end_idx)
 
+        if len(start_idx.size()) == 1:
+            start_idx = start_idx.unsqueeze(dim=1)
+        if len(end_idx.size()) == 1:
+            end_idx = end_idx.unsqueeze(dim=1)
+
+        return start_idx, end_idx
+
     def convert_targets_to_SQuAD_format(
-        a: List[str], a_start: torch.Tensor, c: List[str], idx: List[str]
+        self, a: List[str], a_start: torch.Tensor, c: List[str], idx: List[str]
     ) -> TARGETS_TYPE:
         """Convert target data into `torchmetrics.text.SQuAD` compatible
         format"""
