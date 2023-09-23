@@ -95,7 +95,9 @@ class SQuADDataModule(L.LightningDataModule):
         pass
 
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
+@hydra.main(
+    version_base=None, config_path="../../configs/data", config_name="config"
+)
 def main(cfg: DictConfig):
     dataloader = hydra.utils.instantiate(cfg)
 

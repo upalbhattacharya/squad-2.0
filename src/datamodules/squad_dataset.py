@@ -23,7 +23,9 @@ class SQuADDataset(Dataset):
         return len(self.df)
 
 
-@hydra.main(version_base=None, config_path=".", config_name="df_test")
+@hydra.main(
+    version_base=None, config_path="../../configs/data", config_name="df_test"
+)
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
     dataset = SQuADDataset(cfg.df_path)
