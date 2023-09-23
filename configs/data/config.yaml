@@ -1,0 +1,6 @@
+_target_: src.datamodules.squad_datamodule.SQuADDataModule
+data_dir: ../../data/cross_validation/5_fold/fold_1
+batch_size: 64
+num_workers:
+  _target_: os.cpu_count
+pin_memory: False

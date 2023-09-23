@@ -1,5 +1,5 @@
-venv/**
+venv
 .ipynb_checkpoints
-data
-**/__pycache__/**
-**/lightning_logs/**
+data/**
+__pycache__
+lightning_logs
