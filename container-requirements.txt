@@ -1,0 +1,6 @@
+hydra-core
+lightning
+pandas
+pyrootutils
+torchmetrics
+transformers
