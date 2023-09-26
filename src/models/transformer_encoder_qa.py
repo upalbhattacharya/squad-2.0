@@ -6,7 +6,7 @@ implementation for Question-Answering"""
 
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from typing import SupportsFloat as Numeric
 from typing import Tuple, Union
 
@@ -29,7 +29,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
-        scheduler: Optional[torch.optim.lr_scheduler],
+        scheduler: Any,
         lm_name: str = "bert-base-uncased",
         truncation_side: str = "right",
         max_length: int = 512,
@@ -73,8 +73,9 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.train_squad = torchmetrics.text.SQuAD()
         self.test_squad = torchmetrics.text.SQuAD()
         self.validation_squad = torchmetrics.text.SQuAD()
+
         self.validation_squad_f1_best = torchmetrics.MaxMetric()
-        self.validation_squad_exact_match_best = torchmetrics.MaxMetric()
+        self.validation_squad_em_best = torchmetrics.MaxMetric()
 
         self.train_start_loss = torchmetrics.MeanMetric()
         self.train_end_loss = torchmetrics.MeanMetric()
@@ -89,23 +90,26 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.test_loss = torchmetrics.MeanMetric()
 
     def process(self, q: Union[str, List[str]], c: Union[str, List[str]]):
-        if isinstance(q, str) and isinstance(c, str):
+        try:
+            if isinstance(q, str) and isinstance(c, str):
+                return self.tokenizer(
+                    q,
+                    c,
+                    truncation="only_second",
+                    padding="longest",
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+
             return self.tokenizer(
-                q,
-                c,
+                [[a, b] for a, b in zip(q, c)],
                 truncation="only_second",
                 padding="longest",
                 max_length=self.max_length,
                 return_tensors="pt",
             )
-
-        return self.tokenizer(
-            [[a, b] for a, b in zip(q, c)],
-            truncation="only_second",
-            padding="longest",
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        except Exception as e:
+            print(q, c)
 
     def convert_to_compatible_tokens(
         self, a: List[str], c: List[str]
@@ -134,9 +138,11 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
                 )
                 if context_ids_list[i][idx : idx + len(answer_ids_list[i])]
                 == answer_ids_list[i]
-            ][0]
+            ]
             for i in range(len(answer_ids_list))
         ]
+
+        start_idx = [v[0] if v else 0 for v in start_idx]
         end_idx = [
             [start_idx[i] + len(answer_ids_list[i])]
             for i in range(len(start_idx))
@@ -209,7 +215,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         start_loss: torch.Tensor,
         end_loss: torch.Tensor,
         loss: torch.Tensor,
-        squad: Dict[Numeric, Numeric],
+        squad: Dict[str, torch.Tensor],
     ) -> None:
         self.log(
             os.path.join(name, "start_loss"),
@@ -226,12 +232,16 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         self.log(
             os.path.join(name, "loss"), loss, on_step=False, on_epoch=True
         )
+        squad_score = squad.compute()
         self.log(
-            os.path.join(name, "f1"), squad["f1"], on_step=False, on_epoch=True
+            os.path.join(name, "squad_f1"),
+            squad_score["f1"],
+            on_step=False,
+            on_epoch=True,
         )
         self.log(
-            os.path.join(name, "exact_match"),
-            squad["exact_match"],
+            os.path.join(name, "squad_em"),
+            squad_score["exact_match"],
             on_step=False,
             on_epoch=True,
         )
@@ -267,6 +277,8 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         ignore_index = start_logits.size(1)
         start_positions = start_positions.clamp(0, ignore_index)
         end_positions = end_positions.clamp(0, ignore_index)
+        start_positions = start_positions.to(self.device)
+        end_positions = end_positions.to(self.device)
         criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
         start_loss = criterion(start_logits, start_positions)
         end_loss = criterion(end_logits, end_positions)
@@ -284,6 +296,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     def training_step(
         self,
         batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+        batch_idx: int,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -315,7 +328,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
                 start_logits, end_logits, c, idx
             )
         )
-        self.train_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.train_squad.update(predicted_texts_SQuAD, targets_SQuAD)
         self.log_stats(
             "train",
             self.train_start_loss,
@@ -333,6 +346,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     def validation_step(
         self,
         batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+        batch_idx: int,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -364,7 +378,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
                 start_logits, end_logits, c, idx
             )
         )
-        self.validation_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.validation_squad.update(predicted_texts_SQuAD, targets_SQuAD)
         self.log_stats(
             "validation",
             self.validation_start_loss,
@@ -382,6 +396,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
     def test_step(
         self,
         batch: Tuple[List[str], List[str], torch.Tensor, List[str], List[str]],
+        batch_idx: int,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -413,7 +428,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
                 start_logits, end_logits, c, idx
             )
         )
-        self.test_squad(predicted_texts_SQuAD, targets_SQuAD)
+        self.test_squad.update(predicted_texts_SQuAD, targets_SQuAD)
         self.log_stats(
             "test",
             self.test_start_loss,
@@ -466,7 +481,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         val_f1 = val_squad["f1"]
         val_exact_match = val_squad["exact_match"]
         self.validation_squad_f1_best(val_f1)
-        self.validation_squad_exact_match_best(val_exact_match)
+        self.validation_squad_em_best(val_exact_match)
         self.log(
             "val/best_f1",
             self.validation_squad_f1_best.compute(),
@@ -474,7 +489,7 @@ class TransformerEncoderQuestionAnswering(L.LightningModule):
         )
         self.log(
             "val/best_exact_match",
-            self.validation_squad_exact_match_best.compute(),
+            self.validation_squad_em_best.compute(),
             prog_bar=True,
         )
 
