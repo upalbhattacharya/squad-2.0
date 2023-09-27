@@ -1,0 +1,10 @@
+version: 1
+services:
+  squad2:
+    image: squad2-env:latest
+    container_name: squad2
+    tty: true
+    ports:
+      - 8888:8888
+    devices:
+      - nvidia.com/gpu=all
